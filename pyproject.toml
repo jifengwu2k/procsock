@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "procsock"
+version = "0.1.0a0"
+description = "A small tool for running and tracking background processes over a local TCP port."
+readme = "README.md"
+requires-python = ">=2"
+license = "MIT"
+authors = [
+  { name="Jifeng Wu", email="jifengwu2k@gmail.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 2",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "ctypes-unicode-proclaunch",
+    "read-unicode-environment-variables-dictionary",
+    "send-recv-json",
+    "typing; python_version < '3.5'"
+]
+
+[project.scripts]
+procsock = "procsock:main"
+
+[project.urls]
+"Homepage" = "https://github.com/jifengwu2k/procsock"
+"Bug Tracker" = "https://github.com/jifengwu2k/procsock/issues"
