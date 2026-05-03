@@ -447,7 +447,7 @@ def _connect_with_auto_start(app_name, instance):
     devnull_w = open(os.devnull, "wb")
     try:
         ctypes_unicode_proclaunch.launch(
-            [sys.executable, sys.argv[0], "server", "--instance", instance],
+            [sys.executable, __file__, "server", "--instance", instance],
             stdin_file_descriptor=devnull_r.fileno(),
             stdout_file_descriptor=devnull_w.fileno(),
             stderr_file_descriptor=devnull_w.fileno(),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "procsock"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "A small tool for running and tracking background processes over a local TCP port."
 readme = "README.md"
 requires-python = ">=2"
