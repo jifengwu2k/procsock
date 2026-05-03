@@ -1,27 +1,29 @@
 # Copyright (c) 2025 Jifeng Wu
 # Licensed under the MIT License. See LICENSE file in the project root for full license information.
 #!/usr/bin/env python
-
+from __future__ import print_function, unicode_literals
 import argparse
 import json
 import logging
 import os
 import signal
-import socket
 import sys
 import threading
 import time
 from itertools import count
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Text, Tuple
+
+import dockpoint
 
 import ctypes_unicode_proclaunch
 from read_unicode_environment_variables_dictionary import (
     read_unicode_environment_variables_dictionary,
 )
 from send_recv_json import recv_json, send_json
+from textcompat import filesystem_str_to_text
 
 JSONRPC_VERSION = "2.0"
-DEFAULT_HOST = "localhost"
+DEFAULT_APP_NAME = "procsock"
 
 
 class UnknownPidError(Exception):
@@ -34,9 +36,9 @@ class TempCwd(object):
     _lock = threading.RLock()
 
     def __init__(self, cwd):
-        # type: (str) -> None
-        self.cwd = cwd  # type: str
-        self.previous_cwd = None  # type: Optional[str]
+        # type: (Text) -> None
+        self.cwd = cwd  # type: Text
+        self.previous_cwd = None  # type: Optional[Text]
 
     def __enter__(self):
         # type: () -> "TempCwd"
@@ -87,13 +89,13 @@ class Process(object):
         exit_code,
         wait_thread=None,
     ):
-        # type: (int, List[str], str, str, str, str, bool, float, Optional[float], Optional[int], Optional[threading.Thread]) -> None
+        # type: (int, List[Text], Text, Text, Text, Text, bool, float, Optional[float], Optional[int], Optional[threading.Thread]) -> None
         self.pid = pid  # type: int
-        self.argv = argv  # type: List[str]
-        self.cwd = cwd  # type: str
-        self.stdin_path = stdin_path  # type: str
-        self.stdout_path = stdout_path  # type: str
-        self.stderr_path = stderr_path  # type: str
+        self.argv = argv  # type: List[Text]
+        self.cwd = cwd  # type: Text
+        self.stdin_path = stdin_path  # type: Text
+        self.stdout_path = stdout_path  # type: Text
+        self.stderr_path = stderr_path  # type: Text
         self.finished = finished  # type: bool
         self.started_at = started_at  # type: float
         self.finished_at = finished_at  # type: Optional[float]
@@ -101,7 +103,7 @@ class Process(object):
         self.wait_thread = wait_thread  # type: Optional[threading.Thread]
 
     def to_dict(self):
-        # type: () -> Dict[str, Any]
+        # type: () -> Dict[Text, Any]
         return {
             "pid": self.pid,
             "argv": self.argv,
@@ -167,45 +169,51 @@ class ProcessTable(object):
 
 class ProcSockServer(object):
     __slots__ = (
-        "host",
-        "port",
+        "app_name",
+        "instance",
         "processes",
         "stop_event",
-        "server_socket",
+        "dockpoint_ref",
         "connection_threads",
         "connection_threads_lock",
     )
 
-    def __init__(self, host, port):
-        # type: (str, int) -> None
-        self.host = host  # type: str
-        self.port = port  # type: int
+    def __init__(self, app_name=DEFAULT_APP_NAME, instance=dockpoint.DEFAULT_INSTANCE):
+        # type: (Text, Text) -> None
+        self.app_name = app_name  # type: Text
+        self.instance = instance  # type: Text
         self.processes = ProcessTable()
         self.stop_event = threading.Event()
-        self.server_socket = None  # type: Optional[socket.socket]
+        self.dockpoint_ref = None  # type: Optional[dockpoint.Dockpoint]
         self.connection_threads = set()  # type: Set[threading.Thread]
         self.connection_threads_lock = threading.Lock()
 
     def serve_forever(self):
         # type: () -> None
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen()
-        logging.info("listening on %s:%s", self.host, self.port)
+        self.dockpoint_ref = dockpoint.claim(self.app_name, self.instance)
+        if self.dockpoint_ref is None:
+            raise RuntimeError(
+                "could not claim dockpoint for app_name=%r instance=%r"
+                % (self.app_name, self.instance)
+            )
+        logging.info(
+            "claimed dockpoint app_name=%r instance=%r",
+            self.app_name,
+            self.instance,
+        )
 
         self._install_signal_handlers()
 
         try:
             while not self.stop_event.is_set():
                 try:
-                    conn, addr = self.server_socket.accept()
-                except OSError:
+                    conn = self.dockpoint_ref.accept()
+                except (OSError, ValueError):
                     if self.stop_event.is_set():
                         break
                     raise
                 thread = threading.Thread(
-                    target=self._handle_connection, args=(conn, addr), daemon=True
+                    target=self._handle_connection, args=(conn,), daemon=True
                 )
                 with self.connection_threads_lock:
                     self.connection_threads.add(thread)
@@ -219,10 +227,10 @@ class ProcSockServer(object):
             # type: (int, Any) -> None
             logging.info("received signal %s, shutting down", signum)
             self.stop_event.set()
-            if self.server_socket is not None:
+            if self.dockpoint_ref is not None:
                 try:
-                    self.server_socket.close()
-                except OSError:
+                    self.dockpoint_ref.close()
+                except (OSError, ValueError):
                     pass
 
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -234,12 +242,12 @@ class ProcSockServer(object):
             pass
         else:
             self.stop_event.set()
-        if self.server_socket is not None:
+        if self.dockpoint_ref is not None:
             try:
-                self.server_socket.close()
-            except OSError:
+                self.dockpoint_ref.close()
+            except (OSError, ValueError):
                 pass
-            self.server_socket = None
+            self.dockpoint_ref = None
 
         unfinished = self.processes.unfinished()
         for process in unfinished:
@@ -254,18 +262,17 @@ class ProcSockServer(object):
                 continue
             thread.join()
 
-    def _handle_connection(self, conn, addr):
-        # type: (socket.socket, Tuple[str, int]) -> None
+    def _handle_connection(self, conn):
+        # type: (dockpoint.DockpointConnection) -> None
         request = None  # type: Any
         try:
             with conn:
                 try:
-                    request = recv_json(conn.recv)
+                    request = recv_json(conn.read)
                     response = self._dispatch_request(request)
                 except Exception as exc:  # noqa: BLE001
                     logging.warning(
-                        "request handling failed from %s: %s: %s",
-                        addr,
+                        "request handling failed: %s: %s",
                         type(exc).__name__,
                         exc,
                     )
@@ -275,14 +282,14 @@ class ProcSockServer(object):
                         ),
                         exc=exc,
                     )
-                send_json(conn.send, response)
+                send_json(conn.write, response)
         finally:
             with self.connection_threads_lock:
                 thread = threading.current_thread()
                 self.connection_threads.discard(thread)
 
     def _dispatch_request(self, request):
-        # type: (Any) -> Dict[str, Any]
+        # type: (Any) -> Dict[Text, Any]
         request_id = request["id"]
         method = request["method"]
         params = request.get("params", {})
@@ -306,9 +313,9 @@ class ProcSockServer(object):
         return {"jsonrpc": JSONRPC_VERSION, "id": request_id, "result": result}
 
     def launch(self, argv, cwd, stdin_path, stdout_path, stderr_path, env):
-        # type: (List[str], str, str, str, str, Optional[Dict[str, str]]) -> Dict[str, Any]
+        # type: (List[Text], Text, Text, Text, Text, Optional[Dict[Text, Text]]) -> Dict[Text, Any]
         ready = threading.Event()
-        outcome = {}  # type: Dict[str, Any]
+        outcome = {}  # type: Dict[Text, Any]
 
         def launcher_target():
             # type: () -> None
@@ -338,7 +345,7 @@ class ProcSockServer(object):
         return process.to_dict()
 
     def _launch_process(self, argv, cwd, stdin_path, stdout_path, stderr_path, env):
-        # type: (List[str], str, str, str, str, Optional[Dict[str, str]]) -> int
+        # type: (List[Text], Text, Text, Text, Text, Optional[Dict[Text, Text]]) -> int
         stdin_file = None  # type: Any
         stdout_file = None  # type: Any
         stderr_file = None  # type: Any
@@ -397,11 +404,11 @@ class ProcSockServer(object):
             self.processes.mark_finished(pid, None)
 
     def list_processes(self):
-        # type: () -> List[Dict[str, Any]]
+        # type: () -> List[Dict[Text, Any]]
         return [process.to_dict() for process in self.processes.list()]
 
     def terminate(self, pid):
-        # type: (int) -> Dict[str, Any]
+        # type: (int) -> Dict[Text, Any]
         process = self.processes.get(pid)
         if not process.finished:
             ctypes_unicode_proclaunch.terminate(process.pid)
@@ -410,7 +417,7 @@ class ProcSockServer(object):
 
 
 def make_error_response(request_id, exc):
-    # type: (Any, Exception) -> Dict[str, Any]
+    # type: (Any, Exception) -> Dict[Text, Any]
     return {
         "jsonrpc": JSONRPC_VERSION,
         "id": request_id,
@@ -424,17 +431,62 @@ def make_error_response(request_id, exc):
 _REQUEST_IDS = count(1)
 
 
-def send_jsonrpc_request(host, port, method, params):
-    # type: (str, int, str, Dict[str, Any]) -> Any
+def _connect_with_auto_start(app_name, instance):
+    # type: (Text, Text) -> dockpoint.DockpointConnection
+    """Connect to the dockpoint server, auto-starting it if unavailable."""
+    conn = dockpoint.connect(app_name, instance)
+    if conn is not None:
+        return conn
+
+    logging.info(
+        "server not running for app_name=%r instance=%r, auto-starting...",
+        app_name,
+        instance,
+    )
+    devnull_r = open(os.devnull, "rb")
+    devnull_w = open(os.devnull, "wb")
+    try:
+        ctypes_unicode_proclaunch.launch(
+            [sys.executable, sys.argv[0], "server", "--instance", instance],
+            stdin_file_descriptor=devnull_r.fileno(),
+            stdout_file_descriptor=devnull_w.fileno(),
+            stderr_file_descriptor=devnull_w.fileno(),
+        )
+    finally:
+        devnull_r.close()
+        devnull_w.close()
+
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        time.sleep(0.05)
+        conn = dockpoint.connect(app_name, instance)
+        if conn is not None:
+            logging.info(
+                "server auto-started successfully app_name=%r instance=%r",
+                app_name,
+                instance,
+            )
+            return conn
+
+    raise RuntimeError(
+        "could not connect to dockpoint app_name=%r instance=%r"
+        " (server auto-start timed out)"
+        % (app_name, instance)
+    )
+
+
+def send_jsonrpc_request(app_name, instance, method, params):
+    # type: (Text, Text, Text, Dict[Text, Any]) -> Any
     request = {
         "jsonrpc": JSONRPC_VERSION,
         "id": next(_REQUEST_IDS),
         "method": method,
         "params": params,
     }
-    with socket.create_connection((host, port)) as conn:
-        send_json(conn.send, request)
-        response = recv_json(conn.recv)
+    conn = _connect_with_auto_start(app_name, instance)
+    with conn:
+        send_json(conn.write, request)
+        response = recv_json(conn.read)
     if "error" in response:
         error = response["error"]
         error_type = error.get("type", "Exception")
@@ -443,11 +495,11 @@ def send_jsonrpc_request(host, port, method, params):
     return response["result"]
 
 
-def request_launch(host, port, argv, cwd, stdin_path, stdout_path, stderr_path, env):
-    # type: (str, int, List[str], str, str, str, str, Dict[str, str]) -> Any
+def request_launch(app_name, instance, argv, cwd, stdin_path, stdout_path, stderr_path, env):
+    # type: (Text, Text, List[Text], Text, Text, Text, Text, Dict[Text, Text]) -> Any
     return send_jsonrpc_request(
-        host,
-        port,
+        app_name,
+        instance,
         "launch",
         {
             "argv": argv,
@@ -460,18 +512,18 @@ def request_launch(host, port, argv, cwd, stdin_path, stdout_path, stderr_path, 
     )
 
 
-def request_list(host, port):
-    # type: (str, int) -> Any
-    return send_jsonrpc_request(host, port, "list", {})
+def request_list(app_name, instance):
+    # type: (Text, Text) -> Any
+    return send_jsonrpc_request(app_name, instance, "list", {})
 
 
-def request_terminate(host, port, pid):
-    # type: (str, int, int) -> Any
-    return send_jsonrpc_request(host, port, "terminate", {"pid": pid})
+def request_terminate(app_name, instance, pid):
+    # type: (Text, Text, int) -> Any
+    return send_jsonrpc_request(app_name, instance, "terminate", {"pid": pid})
 
 
 def main(argv=None):
-    # type: (Optional[List[str]]) -> int
+    # type: (Optional[List[Text]]) -> int
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -481,12 +533,10 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command")
 
     server_parser = subparsers.add_parser("server", help="run the procsock server")
-    server_parser.add_argument("--host", default=DEFAULT_HOST)
-    server_parser.add_argument("--port", type=int, required=True)
+    server_parser.add_argument("--instance", default=str(dockpoint.DEFAULT_INSTANCE))
 
     launch_parser = subparsers.add_parser("launch", help="launch a process")
-    launch_parser.add_argument("--host", default=DEFAULT_HOST)
-    launch_parser.add_argument("--port", type=int, required=True)
+    launch_parser.add_argument("--instance", default=str(dockpoint.DEFAULT_INSTANCE))
     launch_parser.add_argument("--cwd", default=None)
     launch_parser.add_argument("--stdin", dest="stdin_path", default=os.devnull)
     launch_parser.add_argument("--stdout", dest="stdout_path", default=os.devnull)
@@ -494,42 +544,50 @@ def main(argv=None):
     launch_parser.add_argument("argv", nargs=argparse.REMAINDER)
 
     list_parser = subparsers.add_parser("list", help="list tracked processes")
-    list_parser.add_argument("--host", default=DEFAULT_HOST)
-    list_parser.add_argument("--port", type=int, required=True)
+    list_parser.add_argument("--instance", default=str(dockpoint.DEFAULT_INSTANCE))
 
     terminate_parser = subparsers.add_parser("terminate", help="terminate a process")
-    terminate_parser.add_argument("--host", default=DEFAULT_HOST)
-    terminate_parser.add_argument("--port", type=int, required=True)
+    terminate_parser.add_argument("--instance", default=str(dockpoint.DEFAULT_INSTANCE))
     terminate_parser.add_argument("pid", type=int)
     args = parser.parse_args(argv)
 
     if args.command == "server":
-        server = ProcSockServer(host=args.host, port=args.port)
+        server = ProcSockServer(
+            app_name=DEFAULT_APP_NAME,
+            instance=filesystem_str_to_text(args.instance)
+        )
         server.serve_forever()
 
     elif args.command == "launch":
-        launch_argv = args.argv[args.argv.index("--") + 1 :]
-        if not launch_argv:
+        launch_argv = list(map(filesystem_str_to_text, args.argv))
+        if len(launch_argv) < 2 or launch_argv[0] != "--":
             raise ValueError("missing command after '--'")
 
         result = request_launch(
-            args.host,
-            args.port,
-            launch_argv,
-            args.cwd if args.cwd is not None else os.getcwd(),
-            args.stdin_path,
-            args.stdout_path,
-            args.stderr_path,
+            DEFAULT_APP_NAME,
+            filesystem_str_to_text(args.instance),
+            launch_argv[1:],
+            filesystem_str_to_text(args.cwd if args.cwd is not None else os.getcwd()),
+            filesystem_str_to_text(args.stdin_path),
+            filesystem_str_to_text(args.stdout_path),
+            filesystem_str_to_text(args.stderr_path),
             read_unicode_environment_variables_dictionary(),
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif args.command == "list":
-        result = request_list(args.host, args.port)
+        result = request_list(
+            DEFAULT_APP_NAME,
+            filesystem_str_to_text(args.instance),
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif args.command == "terminate":
-        result = request_terminate(args.host, args.port, args.pid)
+        result = request_terminate(
+            DEFAULT_APP_NAME,
+            filesystem_str_to_text(args.instance),
+            args.pid
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

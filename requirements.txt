@@ -1,4 +1,6 @@
 ctypes-unicode-proclaunch
+dockpoint
 read-unicode-environment-variables-dictionary
 send-recv-json
+textcompat
 typing; python_version < '3.5'
